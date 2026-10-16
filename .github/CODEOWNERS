@@ -1,0 +1,8 @@
+# Every change needs a review from the owner. The agent's guard rails are listed on their own
+# so the rule stays explicit if the default line is ever loosened.
+*                       @kaushik-sai
+/.github/               @kaushik-sai
+/.claude/               @kaushik-sai
+/CLAUDE.md              @kaushik-sai
+/modules/AgentFlow/     @kaushik-sai
+/scripts/               @kaushik-sai

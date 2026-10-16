@@ -1,0 +1,243 @@
+# agent-ci-fix: when ci fails on an agent PR, Claude Code reads the failure and pushes a fix.
+#
+# Bounded: each fix commit carries an "Agent-Fix-Attempt: N" trailer. After
+# policy.fixLoop.maxAttempts (3) the PR is labelled needs-human and the ticket is told.
+# Same split as agent-ticket-to-pr: the agent job holds no write credential; a fresh
+# publish job checks the patch with main's module before the GitHub App pushes it.
+# workflow_run only fires for this file as it is on the default branch.
+
+name: agent-ci-fix
+
+on:
+  # workflow_run runs with secrets on behalf of a PR, which is why zizmor flags it. Here it is
+  # limited to same-repo agent/* branches, never runs code from the branch with a credential,
+  # and loads every script from main. See SECURITY.md, "The CI fix loop trigger".
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [ci]
+    types: [completed]
+
+permissions: {}
+
+# One fix at a time per branch.
+concurrency:
+  group: agent-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  triage:
+    name: triage
+    # Only failed PR runs, on agent branches, from this repository (never a fork).
+    if: >-
+      ${{ vars.AGENT_ENABLED == 'true' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'agent/') &&
+      github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: agent-intake
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.triage.outputs.action }}
+      attempt: ${{ steps.triage.outputs.attempt }}
+      max_attempts: ${{ steps.triage.outputs.max_attempts }}
+      pr_number: ${{ steps.triage.outputs.pr_number }}
+      issue_key: ${{ steps.triage.outputs.issue_key }}
+    steps:
+      # Scripts and policy come from main, never from the PR branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+
+      # The branch is only read (git log for the attempt count); nothing in it runs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: branch
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 'Triage: fix, escalate or skip'
+        id: triage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          ./trusted/scripts/Invoke-FixTriage.ps1 -RunId $env:RUN_ID -Repository $env:GITHUB_REPOSITORY `
+              -Branch $env:BRANCH -HeadSha $env:HEAD_SHA -LogPath "$env:RUNNER_TEMP/agent/failure.log" -RepoPath ./branch
+
+      # Re-read the ticket from Jira so the fix still works from the source of truth.
+      - name: 'Task: write the agent task file'
+        if: ${{ steps.triage.outputs.action == 'fix' }}
+        env:
+          ISSUE_KEY: ${{ steps.triage.outputs.issue_key }}
+          ATTEMPT: ${{ steps.triage.outputs.attempt }}
+          MAX_ATTEMPTS: ${{ steps.triage.outputs.max_attempts }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          Import-Module ./trusted/modules/AgentFlow -Force
+          $ticket = Get-AgentTicket -IssueKey $env:ISSUE_KEY -Policy (Get-AgentPolicy)
+          $log = Get-Content -LiteralPath "$env:RUNNER_TEMP/agent/failure.log" -Raw
+          New-AgentTask -Mode Fix -Ticket $ticket -FailureLog $log -Attempt $env:ATTEMPT -MaxAttempts $env:MAX_ATTEMPTS `
+              -Path "$env:RUNNER_TEMP/agent/task.md" | Out-Null
+
+      - if: ${{ steps.triage.outputs.action == 'fix' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fix-task
+          path: ${{ runner.temp }}/agent/
+          retention-days: 7
+
+  fix:
+    name: fix
+    needs: triage
+    if: ${{ needs.triage.outputs.action == 'fix' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: agent
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fix-task
+          path: .agent
+
+      - name: 'Tools: pinned Pester and PSScriptAnalyzer'
+        run: ./scripts/Install-CheckTools.ps1
+
+      - name: 'Agent: Claude Code fixes the failure'
+        uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1.0.251
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          anthropic_organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          github_token: ${{ github.token }}
+          display_report: 'false'
+          prompt: |
+            Read .agent/task.md and do what it asks, following CLAUDE.md.
+            When you finish, write a short summary of the cause and the fix to .agent/summary.md.
+          claude_args: >-
+            --model ${{ vars.AGENT_MODEL || 'claude-sonnet-5-5' }}
+            --max-turns 30
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(pwsh -NoProfile -File ./scripts/Invoke-Checks.ps1)"
+            --disallowedTools "WebFetch,WebSearch,Bash(git:*),Bash(gh:*),Bash(curl:*)"
+
+      - name: 'Export: patch and summary'
+        run: ./scripts/Export-AgentPatch.ps1 -OutputPath "$env:RUNNER_TEMP/patch"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fix-patch
+          path: ${{ runner.temp }}/patch/
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [triage, fix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: agent-publish
+    permissions:
+      contents: read
+    env:
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
+      ISSUE_KEY: ${{ needs.triage.outputs.issue_key }}
+      ATTEMPT: ${{ needs.triage.outputs.attempt }}
+      MAX_ATTEMPTS: ${{ needs.triage.outputs.max_attempts }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: branch
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fix-patch
+          path: ${{ runner.temp }}/patch
+
+      # The policy covers the whole branch against main, not only this attempt.
+      - name: 'Policy: apply the patch and run Test-AgentChangePolicy'
+        run: ./trusted/scripts/Import-AgentPatch.ps1 -PatchPath "$env:RUNNER_TEMP/patch/agent.patch" -RepoPath ./branch
+
+      - name: 'Auth: GitHub App token'
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      # Fast-forward only: if someone pushed to the branch meanwhile, this fails instead of overwriting.
+      - name: 'Publish: commit and push the fix'
+        env:
+          GH_APP_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          ./trusted/scripts/Publish-AgentBranch.ps1 -Branch $env:BRANCH -RepoPath ./branch `
+              -Message "$($env:ISSUE_KEY): fix CI (attempt $env:ATTEMPT of $env:MAX_ATTEMPTS)" `
+              -Trailer "Jira: $env:ISSUE_KEY", "Agent-Fix-Attempt: $env:ATTEMPT", "Agent-Run: $env:RUN_URL"
+
+  escalate:
+    name: escalate
+    needs: triage
+    if: ${{ needs.triage.outputs.action == 'escalate' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: agent-intake
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: 'Escalate: label the PR and tell the ticket'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.triage.outputs.pr_number }}
+          ISSUE_KEY: ${{ needs.triage.outputs.issue_key }}
+          MAX_ATTEMPTS: ${{ needs.triage.outputs.max_attempts }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          $message = "The agent made $env:MAX_ATTEMPTS fix attempts and CI is still red. A person needs to take over."
+          gh pr edit $env:PR_NUMBER --repo $env:GITHUB_REPOSITORY --add-label needs-human
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          gh pr comment $env:PR_NUMBER --repo $env:GITHUB_REPOSITORY --body $message
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Import-Module ./modules/AgentFlow -Force
+          Send-JiraComment -IssueKey $env:ISSUE_KEY -Text $message -LinkUrl "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/pull/$env:PR_NUMBER"

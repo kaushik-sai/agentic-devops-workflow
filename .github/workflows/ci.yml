@@ -1,0 +1,116 @@
+# ci: the checks every PR to main must pass, agent PRs included.
+# Branch protection on main requires the "checks" and "workflow-security" jobs (see RUNBOOK.md).
+# agent-ci-fix.yml listens for this workflow by its name: rename both together.
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only token, and no secrets are used: safe to run on agent and contributor code.
+permissions:
+  contents: read
+
+# A new push to a PR cancels the run it replaces; runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ACTIONLINT_VERSION: '1.7.12'
+  # sha256 of actionlint_1.7.12_linux_amd64.tar.gz, from the release's checksums file.
+  ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Tools: pinned Pester and PSScriptAnalyzer'
+        run: ./scripts/Install-CheckTools.ps1
+
+      # The same script the agent and developers run.
+      - name: 'Lint and test: Invoke-Checks.ps1'
+        run: ./scripts/Invoke-Checks.ps1 -TestResultPath "$env:RUNNER_TEMP/pester.xml"
+
+      - name: 'Publish Pester results'
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pester-results
+          path: ${{ runner.temp }}/pester.xml
+          if-no-files-found: ignore
+
+  agent-policy:
+    name: agent-policy
+    # Second line of defence for agent PRs: the publish job already ran this check.
+    if: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'agent/') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: branch
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The module that judges the PR comes from main, not from the PR.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+
+      - name: 'Policy: Test-AgentChangePolicy against main'
+        run: |
+          Import-Module ./trusted/modules/AgentFlow -Force
+          $report = Test-AgentChangePolicy -RepoPath ./branch -BaseRef origin/main -Policy (Get-AgentPolicy)
+          "Files: $($report.Files.Count), lines: $($report.Lines)"
+          if (-not $report.Compliant) {
+              $report.Violations | ForEach-Object { "::error::$_" }
+              exit 1
+          }
+          'Agent change policy: passed.'
+
+  workflow-security:
+    name: workflow-security
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Lint: actionlint (pinned, checksum verified)'
+        run: |
+          $name = "actionlint_$($env:ACTIONLINT_VERSION)_linux_amd64.tar.gz"
+          $archive = Join-Path -Path $env:RUNNER_TEMP -ChildPath $name
+          Invoke-WebRequest -Uri "https://github.com/rhysd/actionlint/releases/download/v$($env:ACTIONLINT_VERSION)/$name" -OutFile $archive
+          $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:ACTIONLINT_SHA256) { Write-Output "::error::Checksum mismatch for $name."; exit 1 }
+          tar -xzf $archive -C $env:RUNNER_TEMP actionlint
+          & (Join-Path -Path $env:RUNNER_TEMP -ChildPath 'actionlint') -color
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # zizmor finds GitHub Actions security problems: template injection, excessive permissions,
+      # unpinned actions, credential persistence. Installed with every wheel hash pinned.
+      - name: 'Security: zizmor'
+        run: |
+          python3 -m pip install --quiet --require-hashes --no-deps -r ./.github/zizmor-requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          zizmor --format plain --min-severity medium .github/workflows
+          if ($LASTEXITCODE -ne 0) { exit 1 }

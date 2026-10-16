@@ -1,0 +1,240 @@
+# agent-ticket-to-pr: a Jira ticket marked ready for the agent becomes a branch and a draft PR.
+#
+# Jira Automation sends a repository_dispatch with only the issue key (docs/JIRA_SETUP.md).
+# Three jobs, so no job holds both the agent and a write credential:
+# 1. intake:    reads the ticket back from Jira, applies the policy, writes the agent's task file.
+# 2. implement: Claude Code edits a checkout of main. Output: a patch. No GitHub write token,
+#               no Jira token. Anything the agent leaves on this runner dies with it.
+# 3. publish:   a fresh runner applies the patch to main, runs the change policy with main's
+#               own module, then the GitHub App commits, pushes and opens a draft PR.
+# The agent never merges. CODEOWNERS review and the ci check are required on main.
+
+name: agent-ticket-to-pr
+
+on:
+  repository_dispatch:
+    types: [jira-ticket-ready]
+  # Manual start for a single ticket, for example after fixing why intake rejected it.
+  workflow_dispatch:
+    inputs:
+      issue_key:
+        description: 'Jira issue key, for example DEVOPS-42'
+        required: true
+        type: string
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+# One run per ticket at a time; a second dispatch for the same ticket waits instead of racing.
+concurrency:
+  group: agent-ticket-${{ github.event.client_payload.issue_key || inputs.issue_key }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  intake:
+    name: intake
+    # Kill switch: set the repository variable AGENT_ENABLED to anything but 'true' to stop all agent runs.
+    if: ${{ vars.AGENT_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: agent-intake
+    permissions:
+      contents: read
+    outputs:
+      issue_key: ${{ steps.ticket.outputs.issue_key }}
+      branch: ${{ steps.ticket.outputs.branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The key comes in through env, never pasted into the script: it is user input.
+      - name: 'Intake: validate the ticket against Jira'
+        id: ticket
+        env:
+          ISSUE_KEY: ${{ github.event.client_payload.issue_key || inputs.issue_key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: ./scripts/Invoke-TicketIntake.ps1 -IssueKey $env:ISSUE_KEY -OutputPath "$env:RUNNER_TEMP/agent/ticket.json"
+
+      - name: 'Task: write the agent task file'
+        run: |
+          Import-Module ./modules/AgentFlow -Force
+          $ticket = Get-Content -LiteralPath "$env:RUNNER_TEMP/agent/ticket.json" -Raw | ConvertFrom-Json
+          New-AgentTask -Mode Implement -Ticket $ticket -Path "$env:RUNNER_TEMP/agent/task.md" | Out-Null
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: intake
+          path: ${{ runner.temp }}/agent/
+          retention-days: 7
+
+  implement:
+    name: implement
+    needs: intake
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Holds only the Claude API credential. Add required reviewers here to approve each run by hand.
+    environment: agent
+    permissions:
+      contents: read
+      # Only for OIDC federation to the Claude API (vars.ANTHROPIC_FEDERATION_RULE_ID).
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: intake
+          path: .agent
+
+      - name: 'Tools: pinned Pester and PSScriptAnalyzer'
+        run: ./scripts/Install-CheckTools.ps1
+
+      # The prompt is fixed; the ticket text only reaches the agent through the task file.
+      # Tools are an allowlist: file edits, search and the repo's own check script. No network, no git.
+      - name: 'Agent: Claude Code implements the ticket'
+        uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1.0.251
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          anthropic_organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          github_token: ${{ github.token }}
+          display_report: 'false'
+          prompt: |
+            Read .agent/task.md and do what it asks, following CLAUDE.md.
+            When you finish, write a short summary of what you changed and why to .agent/summary.md.
+          claude_args: >-
+            --model ${{ vars.AGENT_MODEL || 'claude-sonnet-5-5' }}
+            --max-turns 40
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(pwsh -NoProfile -File ./scripts/Invoke-Checks.ps1)"
+            --disallowedTools "WebFetch,WebSearch,Bash(git:*),Bash(gh:*),Bash(curl:*)"
+
+      # Export the work as a patch. The publish job decides whether it is allowed.
+      - name: 'Export: patch and summary'
+        run: ./scripts/Export-AgentPatch.ps1 -OutputPath "$env:RUNNER_TEMP/patch"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: patch
+          path: ${{ runner.temp }}/patch/
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [intake, implement]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: agent-publish
+    permissions:
+      contents: read
+    env:
+      BRANCH: ${{ needs.intake.outputs.branch }}
+      ISSUE_KEY: ${{ needs.intake.outputs.issue_key }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    outputs:
+      url: ${{ steps.pr.outputs.url }}
+    steps:
+      # main as it is now: the module that judges the patch is one the agent never touched.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: intake
+          path: ${{ runner.temp }}/intake
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: patch
+          path: ${{ runner.temp }}/patch
+
+      - name: 'Policy: apply the patch and run Test-AgentChangePolicy'
+        run: |
+          ./scripts/Import-AgentPatch.ps1 -PatchPath "$env:RUNNER_TEMP/patch/agent.patch" -Branch $env:BRANCH -NewBranch
+
+      # The App token is minted only here, after the policy passed.
+      # Pushes made with GITHUB_TOKEN do not start other workflows; the App's do, so ci runs on the PR.
+      - name: 'Auth: GitHub App token'
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: 'Publish: commit, push and open a draft PR'
+        id: pr
+        env:
+          GH_APP_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          $ticket = Get-Content -LiteralPath "$env:RUNNER_TEMP/intake/ticket.json" -Raw | ConvertFrom-Json
+          ./scripts/Publish-AgentBranch.ps1 -Branch $env:BRANCH -NewBranch `
+              -Message "$($ticket.Key): $($ticket.Summary)" `
+              -Trailer "Jira: $($ticket.Key)", "Agent-Run: $env:RUN_URL"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $summaryPath = "$env:RUNNER_TEMP/patch/summary.md"
+          $summary = if (Test-Path -LiteralPath $summaryPath) { Get-Content -LiteralPath $summaryPath -Raw } else { '_The agent wrote no summary._' }
+          $body = @(
+              "Jira: **$($ticket.Key)**. Opened by the agent from run $env:RUN_URL."
+              ''
+              '## What the agent says it changed'
+              $summary
+              ''
+              '## Review checklist'
+              '- [ ] The change does what the ticket asks, and nothing else'
+              '- [ ] Tests cover the new behaviour, and no test was weakened'
+              '- [ ] No secrets, and no new dependencies without a reason'
+          ) -join "`n"
+          $bodyPath = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'pr-body.md'
+          Set-Content -LiteralPath $bodyPath -Value $body -Encoding utf8NoBOM
+          $url = gh pr create --repo $env:GITHUB_REPOSITORY --draft --base main --head $env:BRANCH `
+              --title "$($ticket.Key): $($ticket.Summary)" --body-file $bodyPath --label agent
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "url=$url" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+
+  notify:
+    name: notify
+    needs: [intake, implement, publish]
+    # Report back to the ticket whatever happened, once intake accepted it.
+    if: ${{ always() && needs.intake.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: agent-intake
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Jira: comment the outcome on the ticket'
+        env:
+          ISSUE_KEY: ${{ needs.intake.outputs.issue_key }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          PR_URL: ${{ needs.publish.outputs.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          Import-Module ./modules/AgentFlow -Force
+          if ($env:PUBLISH_RESULT -eq 'success' -and $env:PR_URL) {
+              Send-JiraComment -IssueKey $env:ISSUE_KEY -Text 'The agent opened a draft PR for review:' -LinkUrl $env:PR_URL
+          }
+          else {
+              Send-JiraComment -IssueKey $env:ISSUE_KEY -Text 'The agent run did not open a PR. Details:' -LinkUrl $env:RUN_URL
+          }

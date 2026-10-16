@@ -1,0 +1,9 @@
+# Keeps the SHA-pinned actions current. Each update is a PR that goes through ci and review.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies]
+    open-pull-requests-limit: 5

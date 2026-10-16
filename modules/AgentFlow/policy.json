@@ -1,0 +1,46 @@
+{
+  "jira": {
+    "allowedProjects": [
+      "DEVOPS"
+    ],
+    "readyStatus": "Ready for Agent",
+    "requiredLabel": "agent-ok",
+    "allowedIssueTypes": [
+      "Task",
+      "Bug",
+      "Story"
+    ],
+    "maxSummaryLength": 200,
+    "maxDescriptionLength": 20000
+  },
+  "branch": {
+    "prefix": "agent/",
+    "maxSlugLength": 40
+  },
+  "fixLoop": {
+    "maxAttempts": 3,
+    "maxLogBytes": 60000,
+    "attemptTrailer": "Agent-Fix-Attempt"
+  },
+  "changes": {
+    "protectedPaths": [
+      ".github/**",
+      ".claude/**",
+      "CLAUDE.md",
+      "CODEOWNERS",
+      ".agent/**",
+      ".gitattributes",
+      ".gitignore",
+      "modules/AgentFlow/**",
+      "scripts/**",
+      "tests/AgentFlow/**",
+      "PSScriptAnalyzerSettings.psd1",
+      "**/*.pem",
+      "**/*.key",
+      "**/.env",
+      "**/.env.*"
+    ],
+    "maxFilesChanged": 25,
+    "maxLinesChanged": 800
+  }
+}
