@@ -1,0 +1,22 @@
+# Secrets and local config: never commit
+.env
+.env.*
+*.pat
+*.pem
+*.key
+secrets/
+.secrets/
+
+# Agent working files (task, failure log). Written per run, never committed.
+.agent/
+
+# Pester / analyzer output
+TestResults.xml
+coverage.xml
+*.nupkg
+out/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
